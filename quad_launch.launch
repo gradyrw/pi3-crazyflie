@@ -1,0 +1,27 @@
+<launch>
+  <rosparam>
+    ALPHA: 0.0
+    LAG: 0
+    VARS: [.75, .75, .75, .25]
+  </rosparam>
+  <node
+      pkg = "pi3_crazyflie_pkg"
+      type = "crazyflie_state.py"
+      name = "transfer_node"
+  />
+  <node
+      pkg = "pi3_crazyflie_pkg"
+      type = "crazyflie_angles.py"
+      name = "angles_and_commander"
+  />
+  <node
+      pkg = "pi3_crazyflie_pkg"
+      type = "pi3_main_quad"
+      name = "pi3_controller"
+  />
+  <node
+      pkg = "pi3_crazyflie_pkg"
+      type = "pi3_goal.py"
+      name = "goal_node"
+  />
+</launch>

@@ -1,0 +1,985 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <curand.h>
+#include <lwpr.h>
+#include <math.h>
+#include <lwpr_xml.h>
+#include "ros/ros.h"
+#include "pi3_crazyflie_pkg/rpyt.h"
+#include "pi3_crazyflie_pkg/quadrotor_state.h"
+
+#define CONTROL_DIM 4
+#define STATE_DIM 9
+//The total number of LWPR models (NOT RELATED TO NUMER OF LOCAL MODELS)
+#define DERIV_STATE_DIM 6
+//N is the number of states in an LWPR model, in this case 13
+#define N 11
+#define K 1000
+#define M 8
+#define NUM_ITERATIONS 1
+#define T 50
+#define HZ 50
+#define MAX_VAR 10.0
+
+#define BLOCKSIZE 1024
+
+#define MASS .022
+
+#define LAG 1
+#define DO_SMOOTHING true; // note this is hardcoded right now
+#define ALPHA .5
+
+//Defines a class for maintaining callbacks updating the current state
+class StateUpdater
+{
+private:
+  ros::NodeHandle n;
+  ros::Subscriber sub;
+public:
+  float s[STATE_DIM];
+  StateUpdater(float* init_state);
+  void init_subscriber(std::string topic);
+  void stateCallback(const pi3_crazyflie_pkg::quadrotor_state::ConstPtr& state_msg);
+};
+
+StateUpdater::StateUpdater(float* init_state) {
+  int i;
+  for (i = 0; i < STATE_DIM; i++) {
+    s[i] = init_state[i];
+  }
+}
+
+void StateUpdater::stateCallback(const pi3_crazyflie_pkg::quadrotor_state::ConstPtr& state_msg) {
+  s[0] = state_msg->x;
+  s[1] = state_msg->y;
+  s[2] = state_msg->z;
+
+  s[3] = state_msg->roll;
+  s[4] = state_msg->pitch;
+  s[5] = state_msg->yaw;
+
+  s[6] = state_msg->x_dot;
+  s[7] = state_msg->y_dot;
+  s[8] = state_msg->z_dot;
+}
+
+void StateUpdater::init_subscriber(std::string topic) {
+  sub = n.subscribe(topic, 1, &StateUpdater::stateCallback, this);
+}
+
+static void HandleError( cudaError_t err,
+                         const char *file,
+                         int line ) {
+    if (err != cudaSuccess) {
+        printf( "%s in %s at line %d\n", cudaGetErrorString( err ),
+                file, line );
+        exit( EXIT_FAILURE );
+    }
+}
+#define HANDLE_ERROR( err ) (HandleError( err, __FILE__, __LINE__ ))
+
+//Define a data structure which contains the elements
+//of an LWPR receptive field needed to make a prediction.
+typedef struct {
+  float c[N];
+  float D[N*N];
+  int trustworthy;
+  float beta0;
+  float mean_x[N];
+  int nReg;
+  float n_data[N];
+  float U[N*N];
+  float P[N*N];
+  float beta[N];
+  float SSs2[N];
+  float sum_e_cv2[N];
+  float sum_W[N];
+  float SSp;
+} RF_Predict;
+
+//Transfers data from a full receptive field to a (smaller) rfPredict struct
+void rfTransfer(LWPR_ReceptiveField *rf_orig, RF_Predict *rf_pred, int nInS) {
+  int i,j;
+  int R = rf_orig->nReg;
+  for (i = 0; i < N; i++) {
+    for (j = 0; j < N; j++){
+      rf_pred->D[i*N + j] = float(rf_orig->D[nInS*i + j]);
+    }
+  }
+  for (i = 0; i < N; i++) {
+    for (j = 0; j < N; j++) {
+      if (i < R) {
+	rf_pred->U[i*N + j] = float(rf_orig->U[i*nInS + j]);
+	rf_pred->P[i*N + j] = float(rf_orig->P[i*nInS + j]);
+      }
+      else {
+	//Pad un-used part of the array with zeros to prevent memory leaks
+	rf_pred->U[i*N + j] = 0;
+	rf_pred->P[i*N + j] = 0;
+      }
+    }
+  }
+  for (i = 0; i < N; i++) {
+    rf_pred->c[i] = float(rf_orig->c[i]);
+    rf_pred->mean_x[i] = float(rf_orig->mean_x[i]);
+  }
+  for (i = 0; i < R; i++) {
+    rf_pred->n_data[i] = float(rf_orig->n_data[i]);
+    rf_pred->beta[i] = float(rf_orig->beta[i]);
+    rf_pred->SSs2[i] = float(rf_orig->SSs2[i]);
+    rf_pred->sum_e_cv2[i] = float(rf_orig->sum_e_cv2[i]);
+    rf_pred->sum_W[i] = float(rf_orig->sum_w[i]);
+  }
+  for (i = R; i < N; i++) {
+    rf_pred->n_data[i] = 0;
+    rf_pred->beta[i] = 0;
+    rf_pred->SSs2[i] = 0;
+    rf_pred->sum_e_cv2[i] = 0;
+    rf_pred->sum_W[i] = 0;
+  }
+  rf_pred->trustworthy = rf_orig->trustworthy;
+  rf_pred->beta0 = float(rf_orig->beta0);
+  rf_pred->nReg = rf_orig->nReg;
+  rf_pred->SSp = float(rf_orig->SSp);
+}
+
+//==============================================================================
+//----------------------------CUDA FUNCTIONS------------------------------------
+//==============================================================================
+
+__constant__ float U_d[T*CONTROL_DIM];
+__constant__ float dm_d[T*M*DERIV_STATE_DIM];
+__constant__ float norm_in_d[N];
+
+__device__ void print_vec(float* A, float* B, int n) {
+  printf("\n\n++++++++++++++++++++++++++++++++++++++++++");
+  printf("\n Printing A \n");
+  for (int i = 0; i < n; i++) {
+    printf("  %f  ", A[i]);
+  }
+  printf("- \n \n -");
+  printf("\n Printing B \n");
+  for (int i = 0; i < n; i++) {
+    printf("  %f  ", B[i]);
+  }
+  printf("=================================\n");
+}
+
+__device__ void rf_to_shared_mem(RF_Predict *rf_s, RF_Predict *rf_g, int idx) {
+  //Smaller indices load arrays
+  if (idx < N*N) {
+    rf_s->D[idx] = rf_g->D[idx];
+  }
+  else if (idx >= N*N && idx < 2*N*N) {
+    rf_s->U[idx-N*N] = rf_g->U[idx-N*N];
+  }
+  else if (idx >= 2*N*N && idx < 3*N*N) {
+    rf_s->P[idx-2*N*N] = rf_g->P[idx-2*N*N];
+  }
+  //Intermediate indices load vectors
+  else if (idx >= 3*N*N && idx < 3*N*N + N) {
+    rf_s->c[idx-3*N*N] = rf_g->c[idx-3*N*N];
+  }
+  else if (idx >= 3*N*N + N && idx < 3*N*N + 2*N) {
+    rf_s->mean_x[idx-(3*N*N + N)] = rf_g->mean_x[idx-(3*N*N + N)];
+  }
+  else if (idx >= 3*N*N + 2*N && idx < 3*N*N + 3*N) {
+    rf_s->n_data[idx-(3*N*N + 2*N)] = rf_g->n_data[idx-(3*N*N + 2*N)];
+  }
+  else if (idx >= 3*N*N + 3*N && idx < 3*N*N + 4*N) {
+    rf_s->beta[idx-(3*N*N + 3*N)] = rf_g->beta[idx-(3*N*N + 3*N)];
+  }
+  else if (idx >= 3*N*N + 4*N && idx < 3*N*N + 5*N) {
+    rf_s->SSs2[idx-(3*N*N + 4*N)] = rf_g->SSs2[idx-(3*N*N + 4*N)];
+  }
+  else if (idx >= 3*N*N + 5*N && idx < 3*N*N + 6*N) {
+    rf_s->sum_e_cv2[idx-(3*N*N + 5*N)] = rf_g->sum_e_cv2[idx-(3*N*N + 5*N)];
+  }
+  else if (idx >= 3*N*N + 6*N && idx < 3*N*N + 7*N) {
+    rf_s->sum_W[idx-(3*N*N + 6*N)] = rf_g->sum_W[idx-(3*N*N + 6*N)];
+  }
+  //Big indices load scalars
+  else if (idx == 3*N*N + 7*N) {
+    rf_s->trustworthy = rf_g->trustworthy;
+  }
+  else if (idx == 3*N*N + 7*N + 1) {
+    rf_s->beta0 = rf_g->beta0;
+  }
+  else if (idx == 3*N*N + 7*N + 2) {
+    rf_s->nReg = rf_g->nReg;
+  }
+  else if (idx == 3*N*N + 7*N + 3) {
+    rf_s->SSp = rf_g->SSp;
+  }
+}
+
+__device__ void compute_proj(int nR, float* s, float* xc, float* U, float* P) {
+  int i,j;
+  float dot;
+  float xu[N];
+  for (i = 0; i < N; i++) {
+    xu[i] = xc[i];
+  }
+  for (i = 0; i < nR - 1; i++) {
+    dot = 0;
+    for (j = 0; j < N; j++) {
+      dot += U[i*N + j]*xu[j];
+    }
+    s[i] = dot;
+    for (j = 0; j < N; j++) {
+      xu[j] -= s[i]*P[i*N + j];
+    }
+  }  
+  dot = 0;
+  for (i = 0; i < N; i++) {
+    dot += U[(nR - 1)*N + i]*xu[i];
+  }
+  s[nR - 1] = dot;
+}
+
+__device__ void rf_predict(RF_Predict *rf, float* pred_helper, float* x, int index, int t) {
+  int i,j;
+  float xc[N];
+  for (i = 0; i < N; i++) {
+    xc[i] = x[i] - rf->c[i];
+  }
+  float dist = 0;
+  for (i = 0; i < N; i++) {
+    float dot = 0;
+    for (j = 0; j < N; j++) {
+      dot += rf->D[j*N + i]*xc[j];
+    }
+    dist += xc[i]*dot;
+  }
+  float w = __expf(-.5*dist);
+  float yp_n;
+  float sigma2;
+  if (w > .001 && rf->trustworthy) {
+    yp_n = rf->beta0;
+    sigma2 = 0.0;
+    for (i = 0; i < N; i++) {
+      xc[i] = x[i] - rf->mean_x[i];
+    }
+    int nR = rf->nReg;
+    if (rf->n_data[nR-1] <= 2*N) {
+      nR--;
+    }
+    float s[N];
+    compute_proj(nR, s, xc, rf->U, rf->P);
+    for (i = 0; i < nR; i++) {
+      yp_n += s[i]*rf->beta[i];
+      sigma2 += s[i]*s[i] / rf->SSs2[i];
+    }
+    sigma2 = rf->sum_e_cv2[nR-1]/(rf->sum_W[nR-1] - rf->SSp)*(1+w*sigma2);
+    pred_helper[0] = yp_n*w;
+    pred_helper[1] = w;
+    pred_helper[2] = w*yp_n*yp_n;
+    pred_helper[3] = w*sigma2;
+  }
+  else {
+      pred_helper[0] = 0;
+      pred_helper[1] = 0;
+      pred_helper[2] = 0;
+      pred_helper[3] = 0;
+  }
+}
+
+__device__ void compute_predict_conf(RF_Predict* rfs, float* x, int numRFS, float* vals, int t) {
+  int i;
+  float pred_helper[] = {0,0,0,0};
+  float sum_wy = 0;
+  float sum_w = 0;
+  float sum_wyy = 0;
+  float sum_conf = 0;
+  __shared__ RF_Predict rf_s0;
+  __shared__ RF_Predict rf_s1;
+  __shared__ RF_Predict rf_s2;
+  __shared__ RF_Predict rf_s3;
+  __shared__ RF_Predict rf_s4;
+  __shared__ RF_Predict rf_s5;
+  __shared__ RF_Predict rf_s6;
+  __shared__ RF_Predict rf_s7;
+  int tot_el = 3*N*N + 7*N + 4;
+  int idx = threadIdx.x*M + threadIdx.y;
+  for (i = 0; i < numRFS; i+= 7) {    
+    __syncthreads();
+    if (idx < tot_el && i < numRFS) {
+      rf_to_shared_mem(&rf_s0, &rfs[i], idx);
+    }
+    else if (idx >= tot_el && idx < 2*tot_el && i + 1 < numRFS) {
+      rf_to_shared_mem(&rf_s1, &rfs[i+1], idx - tot_el);
+    }
+    else if (idx >= 2*tot_el && idx < 3*tot_el && i + 2 < numRFS) {
+      rf_to_shared_mem(&rf_s2, &rfs[i+2], idx - 2*tot_el);
+    }
+    else if (idx >= 3*tot_el && idx < 4*tot_el && i + 3 < numRFS) {
+      rf_to_shared_mem(&rf_s3, &rfs[i+3], idx - 3*tot_el);
+    }
+    else if (idx >= 4*tot_el && idx < 5*tot_el && i + 4 < numRFS) {
+      rf_to_shared_mem(&rf_s4, &rfs[i+4], idx - 4*tot_el);
+    }
+    else if (idx >= 5*tot_el && idx < 6*tot_el && i + 5 < numRFS) {
+      rf_to_shared_mem(&rf_s5, &rfs[i+5], idx - 5*tot_el);
+    }
+    else if (idx >= 6*tot_el && idx < 7*tot_el && i + 6 < numRFS) {
+      rf_to_shared_mem(&rf_s6, &rfs[i+6], idx - 6*tot_el);
+    }
+    else if (idx >= 7*tot_el && idx < 8*tot_el && i + 7 < numRFS) {
+      rf_to_shared_mem(&rf_s7, &rfs[i+7], idx - 7*tot_el);
+    }
+    __syncthreads();
+    rf_predict(&rf_s0, pred_helper, x, i, t);
+    sum_wy += pred_helper[0];
+    sum_w += pred_helper[1];
+    sum_wyy += pred_helper[2];
+    sum_conf += pred_helper[3];
+
+    if (i + 1 < numRFS) {
+      rf_predict(&rf_s1, pred_helper, x, i+1, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 2 < numRFS) {
+      rf_predict(&rf_s2, pred_helper, x, i+2, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 3 < numRFS) {
+      rf_predict(&rf_s3, pred_helper, x, i+3, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 4 < numRFS) {
+      rf_predict(&rf_s4, pred_helper, x, i+4, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 5 < numRFS) {
+      rf_predict(&rf_s5, pred_helper, x, i+5, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 6 < numRFS) {
+      rf_predict(&rf_s6, pred_helper, x, i+6, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+    }
+    if (i + 7 < numRFS) {
+      rf_predict(&rf_s7, pred_helper, x, i+7, t);
+      sum_wy += pred_helper[0];
+      sum_w += pred_helper[1];
+      sum_wyy += pred_helper[2];
+      sum_conf += pred_helper[3];
+      }
+  }
+  if (sum_w > 0) {
+    vals[0] = sum_wy/sum_w;
+    vals[1] = fmin((float)sqrt(fabs(sum_conf + sum_wyy - sum_wy*vals[0]))/sum_w, (float)MAX_VAR);
+  }
+  else {
+    vals[0] = 0;
+    vals[1] = MAX_VAR;
+  }
+}
+
+__device__ void hand_model(float* s, float* u, float dt) {
+  //  float roll_rate = 1.0*(u[0]) + sin(s[3])*sin(s[4])/cos(s[4])*u[1] + cos(s[3])*sin(s[4])/cos(s[4])*u[2];
+  //float pitch_rate = cos(s[3])*u[1] - sin(s[3])*u[2];
+  //float yaw_rate = sin(s[3])/cos(s[4])*u[1] + cos(s[3])/cos(s[4])*u[2];
+
+  float roll_rate = u[0];
+  float pitch_rate = u[1];
+  float yaw_rate = u[2];
+
+  //Cartesian Coordinates
+  s[0] += dt*s[6];
+  s[1] += dt*s[7];
+  s[2] += dt*s[8];
+  //1-2-3 Extrinsic Euler Angles
+  s[3] += dt*roll_rate;
+  s[4] += dt*pitch_rate;
+  s[5] += dt*yaw_rate;
+  //Cartesian Coordinate Time Derivatives
+  s[6] += dt*-(9.81*MASS + u[3])*(cosf(s[3])*sinf(s[4])*cosf(s[5]) + sinf(s[3])*sinf(s[5]));
+  s[7] += dt*-(9.81*MASS + u[3])*(cosf(s[3])*sinf(s[4])*sinf(s[5]) - sinf(s[3])*cosf(s[5]));
+  s[8] += dt*(-(9.81*MASS + u[3])*cosf(s[4])*cosf(s[3]) + 9.81*MASS);
+  //Euler Angle Time Derivatives
+  //u[0],u[1],u[2]
+}
+
+__device__ void compute_dynamics(float* s, float* u, float* lwpr_input, RF_Predict* rfs1, RF_Predict* rfs2, 
+				 RF_Predict* rfs3, RF_Predict* rfs4, RF_Predict* rfs5, RF_Predict* rfs6, 
+				 float* sigmas, int timestep, int numRFS1, int numRFS2, int numRFS3, int numRFS4,
+				 int numRFS5, int numRFS6) 
+{
+  float dt = 1.0/(1.0*HZ);
+  //Check to see if thrust is allowable
+  float u_max = .4;
+  float u_min = -.4;
+  u[3] = fmax(u_min, u[3]);
+  u[3] = fmin(u_max, u[3]);
+  //hand_model(s, u, dt);
+  //------Problem Specific------------
+  float vals[2];
+  //Normalize according to norm_in_d, note that all lwpr models 
+  //have the same input, hence the same norm_in, and same input.
+  lwpr_input[0] = s[2]/norm_in_d[0];
+  lwpr_input[1] = s[3]/norm_in_d[1];
+  lwpr_input[2] = s[4]/norm_in_d[2];
+  lwpr_input[3] = s[5]/norm_in_d[3];
+  lwpr_input[4] = s[6]/norm_in_d[4];
+  lwpr_input[5] = s[7]/norm_in_d[5];
+  lwpr_input[6] = s[8]/norm_in_d[6];
+  lwpr_input[7] = u[0]/norm_in_d[7];
+  lwpr_input[8] = u[1]/norm_in_d[8];
+  lwpr_input[9] = u[2]/norm_in_d[9];
+  lwpr_input[10] = u[3]/norm_in_d[10];
+  //Compute the updates for x,y, and z
+  s[0] += dt*s[6];
+  s[1] += dt*s[7];
+  s[2] += dt*s[8];
+  //Compute the prediction for roll_dot
+  compute_predict_conf(rfs1, lwpr_input, numRFS1, vals, timestep);
+  s[3] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 0]);
+  //Compute the prediction for pitch_dot
+  compute_predict_conf(rfs2, lwpr_input, numRFS2, vals, timestep);
+  s[4] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 1]);
+  //Compute the prediction for yaw_dot
+  compute_predict_conf(rfs3, lwpr_input, numRFS3, vals, timestep);
+  s[5] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 2]);
+  //Compute the prediction for x_dot
+  compute_predict_conf(rfs4, lwpr_input, numRFS4, vals, timestep);
+  s[6] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 3]);
+  //Compute the prediction for y_dot
+  compute_predict_conf(rfs5, lwpr_input, numRFS5, vals, timestep);
+  s[7] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 4]);
+  //Compute the prediction for z_dot
+  compute_predict_conf(rfs6, lwpr_input, numRFS6, vals, timestep);
+  s[8] += dt*(vals[0] + vals[1]*dm_d[T*DERIV_STATE_DIM*threadIdx.y + DERIV_STATE_DIM*timestep + 5]);
+}
+
+//Computes the immediate cost according to the PI^2 framework.
+//TODO: Add control cost and anti-biasing term.
+__device__ float compute_cost(float* s, float* u, float* goal, float* sigmas)
+{
+  float d1 = (s[0] - goal[0]);
+  float d2 = (s[1] - goal[1]);
+  float d3 = (s[2] - goal[2]);
+  float d4 = (s[3] - goal[3]);
+  float d5 = (s[4] - goal[4]);
+  float d6 = (s[5] - goal[5]);
+  float d7 = (s[6] - goal[6]);
+  float d8 = (s[7] - goal[7]);
+  float d9 = (s[8] - goal[8]);
+
+  float cost = 1*d1*d1 + 1*d2*d2 + 2*d3*d3 + 0.1 * (d4*d4 + d5*d5); // + 0*(d6*d6); 
+
+  // add the dreaded control costs
+  //cost = cost + 10*(u[0]*u[0] + u[1]*u[1]);
+
+  return cost;
+}
+
+__global__ void rollout_kernel(float* aug_state_costs_d, float* state_d, float* goal_d, RF_Predict* rfs1,
+			       RF_Predict* rfs2, RF_Predict* rfs3, RF_Predict* rfs4, RF_Predict* rfs5, 
+			       RF_Predict* rfs6, float* du_d, float* vars_d, int numRFS1, int numRFS2, 
+			       int numRFS3, int numRFS4, int numRFS5, int numRFS6)
+{
+  int tdx = threadIdx.x;
+  int tdy = threadIdx.y;
+  int bdx = blockIdx.x;
+  if (blockDim.x*bdx+tdx < K) {
+    //Initialize the local state
+    float s[STATE_DIM];
+    float u_smooth[CONTROL_DIM] = {0};
+    float u[CONTROL_DIM] = {0};
+    float lwpr_input[N];
+    float vars[CONTROL_DIM];
+    float sigmas[DERIV_STATE_DIM];
+    int i,j;
+    //Load the initial state
+    for (i = 0; i < STATE_DIM; i++) {
+      s[i] = state_d[i];
+    }
+    //Load vars
+    for (i = 0; i < CONTROL_DIM; i++) {
+      vars[i] = vars_d[i];
+    }
+    for (i = 0; i < T; i++) {
+      //Start the main program loop
+      for (j = 0; j < CONTROL_DIM; j++) {
+	if (bdx == 0 && tdx == 0 || i < LAG) {
+	  u[j] = U_d[i*CONTROL_DIM + j];
+	}
+	else {
+	  u[j] = U_d[i*CONTROL_DIM + j] + du_d[CONTROL_DIM*T*(blockDim.x*bdx + tdx) + i*CONTROL_DIM + j]*vars[j];
+	}
+      }
+      int si;
+      //      if (DO_SMOOTHING==1) {
+      // ALPHA is smoothing factor (higher is smoother)
+      if (true) {
+	for (si = 0; si < CONTROL_DIM; si++) {
+	  u_smooth[si] = ALPHA*u_smooth[si] + (1-ALPHA)*u[si];
+	  u[si] = u_smooth[si];
+	}
+
+      }
+      compute_dynamics(s, u, lwpr_input, rfs1, rfs2, rfs3, rfs4, rfs5, rfs6, 
+		       sigmas, i, numRFS1, numRFS2, numRFS3, numRFS4, numRFS5, numRFS6);
+
+      float inst_cost = compute_cost(s, u, goal_d, sigmas);
+      aug_state_costs_d[M*T*((blockDim.x)*bdx + tdx) + T*tdy + i] = inst_cost;
+    }
+  }	
+}
+
+__global__ void expec_costs_kernel(float* state_costs_d, float* aug_state_costs_d)
+{
+  int tdx = threadIdx.x;
+  int bdx = blockIdx.x;
+  float expec_cost = 0;
+  int i;
+  if (tdx < T && bdx < K) {
+    for (i = 0; i < M; i++) {
+      expec_cost += aug_state_costs_d[M*T*bdx + T*i + tdx];
+    }
+    state_costs_d[T*bdx + tdx] = expec_cost/(1.0*M);
+  }
+}
+
+__global__ void norm_exp_costs_kernel(float* state_costs_d)
+{
+  int tdx = threadIdx.x;
+  int bdx = blockIdx.x;
+  int index = blockDim.x*bdx + tdx;
+  if (index < K) {
+    float cost2go = 0;
+    float nf_normal = 0;
+    int i;
+    for (i = T-1; i >= 0; i--) {
+      cost2go += state_costs_d[T*index + i];
+      nf_normal += state_costs_d[i];
+      state_costs_d[T*index + i] = __expf(-10.0*cost2go/nf_normal);
+    }
+  }
+}
+
+__global__ void weight_controls_kernel(float* du_d, float* state_costs_d, float* normalizer_d, float* vars_d)
+{
+  int tdx = threadIdx.x;
+  int bdx = blockIdx.x;
+  int tdy = threadIdx.y;
+  int k;
+  if (tdy < T && bdx*blockDim.x + tdx > 0 && bdx*blockDim.x + tdx < K) {
+    float temp;
+    for (k = 0; k < CONTROL_DIM; k++) {
+      temp = U_d[CONTROL_DIM*tdy + k] + du_d[T*CONTROL_DIM*(bdx*blockDim.x + tdx) + CONTROL_DIM*tdy + k]*vars_d[k];
+      //Only limit thrust
+      if (k == 3) {
+	float u_max = .4;
+	float u_min = -.4;
+	temp = fmin(temp, u_max);
+	temp = fmax(temp, u_min);
+      }
+      //Multiply by the cost-weighting
+      temp *= (state_costs_d[T*(bdx*blockDim.x + tdx) + tdy]/normalizer_d[tdy]);
+      //Store back into du_d
+      du_d[T*CONTROL_DIM*(bdx*blockDim.x + tdx) + CONTROL_DIM*tdy + k] = temp;
+    }
+  }
+  //Do the same for the noise free case
+  else if (bdx*blockDim.x + tdx == 0 && tdy < T) {
+    for (k = 0; k < CONTROL_DIM; k++) {
+      du_d[CONTROL_DIM*tdy + k] = (state_costs_d[T*(bdx*blockDim.x + tdx) + tdy]/normalizer_d[tdy])*U_d[tdy*CONTROL_DIM + k];
+    }
+  }
+}
+
+ __global__ void reduction_kernel(float* in_d, float* out_d, int y_len, int x_len)
+{
+  int tdx = threadIdx.x;
+  int tdy = threadIdx.y;
+  int bdx = blockIdx.x;
+  int bdy = blockIdx.y;
+
+  int x_ind = bdx*16 + tdx;
+  int y_ind = bdy*16 + tdy;
+
+  __shared__ double data[16*16];
+  data[16*tdy + tdx] = 0;
+
+  if (x_ind < x_len && y_ind < y_len) {
+    data[tdy*16 + tdx] = in_d[y_ind*x_len + x_ind];
+  }
+  __syncthreads();
+
+  for (int i = 8; i > 0; i>>=1) {
+    if (tdy < i){
+      data[16*tdy + tdx] += data[16*(tdy+i) + tdx];
+    }
+    __syncthreads();
+  }
+
+  if (tdy == 0 && x_ind < x_len && y_ind < y_len) {
+    out_d[bdy*x_len + x_ind] = data[tdx];
+  }
+}
+  
+
+
+//=========================================================================================
+//--------------------------------END CUDA------------------------------------------------
+//========================================================================================
+
+void compute_control(float* state, float* U, float* goal, LWPR_Model model1, LWPR_Model model2,
+		     LWPR_Model model3, LWPR_Model model4, LWPR_Model model5, LWPR_Model model6,
+		     float* vars, curandGenerator_t gen) {
+  
+  //Timing Code
+  cudaEvent_t start, stop;
+  float time;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  //First we create du_d, perturbations of U which reside in device memory.
+  float* du_d;
+  HANDLE_ERROR( cudaMalloc((void**)&du_d, K*T*CONTROL_DIM*sizeof(float)));
+  curandGenerateNormal(gen, du_d, K*T*CONTROL_DIM, 0.0, 1.0);
+  //Next we create dm_d perturbations of the LWPR model in device memory
+  float* dm_temp;
+  HANDLE_ERROR( cudaMalloc((void**)&dm_temp, M*T*DERIV_STATE_DIM*sizeof(float)));
+  curandGenerateNormal(gen, dm_temp, M*T*DERIV_STATE_DIM, 0.0, 1.0);
+  HANDLE_ERROR( cudaMemcpyToSymbol(dm_d, dm_temp, M*T*DERIV_STATE_DIM*sizeof(float), 0, cudaMemcpyDeviceToDevice));
+  cudaFree(dm_temp);
+  //Create pointers for state, U, goal, rfs1, rfs2, and vars in device memory
+  float* state_d;
+  float* goal_d;
+  float* vars_d;
+  //Transfer relevant data from host LWPR model to device LWPR Receptive Field
+  int i,j;
+  RF_Predict* rfs1;
+  RF_Predict* rfs2;
+  RF_Predict* rfs3;
+  RF_Predict* rfs4;
+  RF_Predict* rfs5;
+  RF_Predict* rfs6;
+  rfs1 = (RF_Predict*)malloc(model1.sub[0].numRFS*sizeof(RF_Predict));
+  rfs2 = (RF_Predict*)malloc(model2.sub[0].numRFS*sizeof(RF_Predict));
+  rfs3 = (RF_Predict*)malloc(model3.sub[0].numRFS*sizeof(RF_Predict)); 
+  rfs4 = (RF_Predict*)malloc(model4.sub[0].numRFS*sizeof(RF_Predict));
+  rfs5 = (RF_Predict*)malloc(model5.sub[0].numRFS*sizeof(RF_Predict));
+  rfs6 = (RF_Predict*)malloc(model6.sub[0].numRFS*sizeof(RF_Predict)); 
+  for (i = 0; i < model1.sub[0].numRFS; i++) {
+    rfTransfer(model1.sub[0].rf[i], &rfs1[i], model1.nInStore);
+  }
+  for (i = 0; i < model2.sub[0].numRFS; i++) {
+    rfTransfer(model2.sub[0].rf[i], &rfs2[i], model2.nInStore);
+  }
+  for (i = 0; i < model3.sub[0].numRFS; i++) {
+    rfTransfer(model3.sub[0].rf[i], &rfs3[i], model3.nInStore);
+  }
+  for (i = 0; i < model4.sub[0].numRFS; i++) {
+    rfTransfer(model4.sub[0].rf[i], &rfs4[i], model4.nInStore);
+  }
+  for (i = 0; i < model5.sub[0].numRFS; i++) {
+    rfTransfer(model5.sub[0].rf[i], &rfs5[i], model5.nInStore);
+  }
+  for (i = 0; i < model6.sub[0].numRFS; i++) {
+    rfTransfer(model6.sub[0].rf[i], &rfs6[i], model6.nInStore);
+  }
+  //Transfer norms to float arrays, NOTE: Only need to do this once since models all
+  //have the same input. If they have different input this code needs to be changed
+  //as well as the CUDA-code in __device__ void compute_dynamics(...)
+  float norm_in[N];
+  for (i = 0; i < N; i++) {
+    norm_in[i] = float(model1.norm_in[i]);
+  }
+ //Create device pointers for rfs1, rfs2, norm_in1, and norm_in2
+  RF_Predict* rfs1_d;
+  RF_Predict* rfs2_d;
+  RF_Predict* rfs3_d;
+  RF_Predict* rfs4_d;
+  RF_Predict* rfs5_d;
+  RF_Predict* rfs6_d;
+  //Allocate space for state, U, goal, rfs1, rfs2, and vars in device memory
+  HANDLE_ERROR( cudaMalloc((void**)&state_d, STATE_DIM*sizeof(float)));
+  HANDLE_ERROR( cudaMalloc((void**)&goal_d, STATE_DIM*sizeof(float)));
+  HANDLE_ERROR( cudaMalloc((void**)&vars_d, CONTROL_DIM*sizeof(float)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs1_d, model1.sub[0].numRFS*sizeof(RF_Predict)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs2_d, model2.sub[0].numRFS*sizeof(RF_Predict)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs3_d, model3.sub[0].numRFS*sizeof(RF_Predict)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs4_d, model4.sub[0].numRFS*sizeof(RF_Predict)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs5_d, model5.sub[0].numRFS*sizeof(RF_Predict)));
+  HANDLE_ERROR( cudaMalloc((void**)&rfs6_d, model6.sub[0].numRFS*sizeof(RF_Predict)));
+  //Copy state, U, goal, model1, and model2 into device memory
+  HANDLE_ERROR( cudaMemcpy(state_d, state, STATE_DIM*sizeof(float), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpyToSymbol(U_d, U, CONTROL_DIM*T*sizeof(float), 0, cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(goal_d, goal, STATE_DIM*sizeof(float), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(vars_d, vars, CONTROL_DIM*sizeof(float), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs1_d, rfs1, model1.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs2_d, rfs2, model2.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs3_d, rfs3, model3.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs4_d, rfs4, model4.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs5_d, rfs5, model5.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpy(rfs6_d, rfs6, model6.sub[0].numRFS*sizeof(RF_Predict), cudaMemcpyHostToDevice));
+  HANDLE_ERROR( cudaMemcpyToSymbol(norm_in_d, norm_in, N*sizeof(float), 0, cudaMemcpyHostToDevice));
+  //Allocate space for the state costs and new controls
+  //For the raw state costs
+  float* aug_state_costs_d;
+  HANDLE_ERROR( cudaMalloc((void**)&aug_state_costs_d, T*K*M*sizeof(float)));
+  //For the averaged state costs
+  float* state_costs_d;
+  //For controls we just re-use du_d
+  HANDLE_ERROR( cudaMalloc((void**)&state_costs_d, T*K*sizeof(float)));
+  //Now we set the grid and block size
+  int xBlockSize = (BLOCKSIZE-1)/M + 1;
+  int yBlockSize = M;
+  int xGridSize = (K-1)/xBlockSize + 1;
+  dim3 dimBlock1(xBlockSize, yBlockSize, 1);
+  dim3 dimGrid1(xGridSize, 1, 1);
+  cudaEventRecord(start, 0);
+  //Now we launch the kernel to compute the new control
+  rollout_kernel<<<dimGrid1, dimBlock1>>>(aug_state_costs_d, state_d, goal_d, rfs1_d, rfs2_d, rfs3_d, rfs4_d, rfs5_d, rfs6_d, du_d, vars_d, model1.sub[0].numRFS, model2.sub[0].numRFS, model3.sub[0].numRFS, model4.sub[0].numRFS, model5.sub[0].numRFS, model6.sub[0].numRFS);
+  cudaDeviceSynchronize();
+  //Wait until the kernel has finished
+  dim3 dimBlock2(T, 1, 1);
+  dim3 dimGrid2(K, 1, 1);
+  //Compute expectation of the costs
+  expec_costs_kernel<<<dimGrid2, dimBlock2>>>(state_costs_d, aug_state_costs_d);
+  cudaDeviceSynchronize();
+  dim3 dimBlock3(64, 1, 1);
+  dim3 dimGrid3((K-1)/64 + 1, 1, 1);
+  //Now we normalize the cost-to-go by the noise free path, and exponentiate by the -lambda*cost2go
+  norm_exp_costs_kernel<<<dimGrid3, dimBlock3>>>(state_costs_d);
+  cudaDeviceSynchronize();
+  //Compute the normalizer
+  //For now just do it on the CPU
+  //Transfer state costs to host memory
+  float* state_costs;
+  state_costs = (float*)malloc(T*K*sizeof(float));
+  HANDLE_ERROR( cudaMemcpy(state_costs, state_costs_d, T*K*sizeof(float), cudaMemcpyDeviceToHost));
+  //Now compute the normalizer
+  float* normalizer;
+  normalizer = (float*)malloc(T*sizeof(float));
+  for (i = 0; i < T; i++) {
+    normalizer[i] = 0;
+    for (j = 0; j < K; j++) {
+      normalizer[i] += state_costs[T*j + i];
+    }
+  }
+  //Compute the new controls
+  //First weight the controls
+  //Transfer normalizer to GPU memory
+  float* normalizer_d;
+  HANDLE_ERROR( cudaMalloc((void**)&normalizer_d, T*sizeof(float)));
+  HANDLE_ERROR( cudaMemcpy(normalizer_d, normalizer, T*sizeof(float), cudaMemcpyHostToDevice));
+  dim3 dimBlock4(4, T, 1);
+  dim3 dimGrid4((K-1)/4 + 1, 1, 1);
+  weight_controls_kernel<<<dimGrid4, dimBlock4>>>(du_d, state_costs_d, normalizer_d, vars_d);
+  cudaDeviceSynchronize();
+  //Just do on CPU for now -> ADDS 10 MS to the program
+  //First transfer controls to host memory
+  float* du;
+  du = (float*)malloc(T*K*CONTROL_DIM*sizeof(float));
+  HANDLE_ERROR( cudaMemcpy(du, du_d, T*K*CONTROL_DIM*sizeof(float), cudaMemcpyDeviceToHost));
+  //Launch the sum reduction to compute the weighted averages
+  j = (K-1)/16 + 1;
+  float* out_d;
+  HANDLE_ERROR( cudaMalloc((void**)&out_d, T*CONTROL_DIM*j*sizeof(float)));
+  dim3 reduce_grid((K*CONTROL_DIM - 1)/16 + 1, j, 1);
+  dim3 reduce_block(16,16,1);
+  int y_len = K;
+  int x_len = T*CONTROL_DIM;
+  reduction_kernel<<<reduce_grid, reduce_block>>>(du_d, out_d, y_len, x_len);
+  cudaDeviceSynchronize();
+  int _k;
+  float* in_d;
+  while (j > 1) {
+    _k = j;
+    j = (j-1)/16 + 1;
+    in_d = out_d;
+    HANDLE_ERROR( cudaMalloc((void**)&out_d, T*CONTROL_DIM*j*sizeof(float)));
+    reduce_grid.y = _k;
+    reduction_kernel<<<reduce_grid, reduce_block>>>(in_d, out_d, _k, x_len);
+    cudaDeviceSynchronize();
+  }
+  HANDLE_ERROR( cudaMemcpy(U, out_d, T*CONTROL_DIM*sizeof(float), cudaMemcpyDeviceToHost));
+  
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  //Free device arrays
+  cudaFree(state_d);
+  cudaFree(goal_d);
+  cudaFree(rfs1_d);
+  cudaFree(rfs2_d);
+  cudaFree(rfs3_d);
+  cudaFree(rfs4_d);
+  cudaFree(rfs5_d);
+  cudaFree(rfs6_d);
+  cudaFree(du_d);
+  cudaFree(state_costs_d);
+  cudaFree(aug_state_costs_d);
+  cudaFree(vars_d);
+  //Free host arrays
+  free(rfs1);
+  free(rfs2);
+  free(rfs3);
+  free(rfs4);
+  free(rfs5);
+  free(rfs6);
+  free(state_costs);
+  free(du);
+  free(normalizer);
+  //Print timing results
+  cudaEventElapsedTime(&time, start, stop);
+  printf("Time: %f ms \n", time);
+}
+
+
+void dynamics(float* s, float* u, float dt) {
+  //Cartesian Coordinates
+  s[0] += dt*s[6];
+  s[1] += dt*s[7];
+  s[2] += dt*s[8];
+  //1-2-3 Extrinsic Euler Angles
+  s[3] += dt*u[0];
+  s[4] += dt*u[1];
+  s[5] += dt*u[2];
+  //Cartesian Coordinate Time Derivatives
+  s[6] += dt*-u[3]*(cos(s[3])*sin(s[4])*cos(s[5]) + sin(s[3])*sin(s[5]));
+  s[7] += dt*-u[3]*(cos(s[3])*sin(s[4])*sin(s[5]) - sin(s[3])*cos(s[5]));
+  s[8] += dt*(-u[3]*cos(s[4])*cos(s[3]) + 9.81*MASS);
+  //Euler Angle Time Derivatives
+  //u[0],u[1],u[2];
+}
+
+int main(int argc, char** argv) {
+  //Initialize ROS
+  ros::init(argc, argv, "pi3_controller");
+  ros::NodeHandle n_pub;
+  ros::Publisher pi3_pub = n_pub.advertise<pi3_crazyflie_pkg::rpyt>("control",1);
+  ros::Rate loop_rate(HZ);
+  pi3_crazyflie_pkg::rpyt control_msg;
+  
+  LWPR_Model model1;
+  LWPR_Model model2;
+  LWPR_Model model3;
+  LWPR_Model model4;
+  LWPR_Model model5;
+  LWPR_Model model6;
+
+  char model_x[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'x', '.', 'x', 'm', 'l', '\0'};
+  char model_y[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'y', '.', 'x', 'm', 'l', '\0'};
+  char model_z[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'z', '.', 'x', 'm', 'l', '\0'};
+  char model_roll[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'r', 'o', 'l', 'l', '.', 'x', 'm', 'l', '\0'};
+  char model_pitch[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'p', 'i', 't', 'c', 'h', '.', 'x', 'm', 'l', '\0'};
+  char model_yaw[] = {'f', 'u', 'l', 'l', '_', 'm', 'o', 'd', 'e', 'l', '_', 'y', 'a', 'w', '.', 'x', 'm', 'l', '\0'};
+  
+  int e1[] = {-3};
+  int e2[] = {-3};
+  int e3[] = {-3};
+  int e4[] = {-3};
+  int e5[] = {-3};
+  int e6[] = {-3};
+
+  lwpr_init_model(&model1, N, 1, "roll_dot");
+  lwpr_init_model(&model2, N, 1, "pitch_dot");
+  lwpr_init_model(&model3, N, 1, "yaw_dot");
+
+  lwpr_init_model(&model4, N, 1, "x_dot");
+  lwpr_init_model(&model5, N, 1, "y_dot");
+  lwpr_init_model(&model6, N, 1, "z_dot");
+
+  //Make models before trying to read from them
+  int a1 = lwpr_read_xml(&model1, model_roll, e1);
+  int a2 = lwpr_read_xml(&model2, model_pitch, e2);
+  int a3 = lwpr_read_xml(&model3, model_yaw, e3);
+
+  int a4 = lwpr_read_xml(&model4, model_x, e1);
+  int a5 = lwpr_read_xml(&model5, model_y, e2);
+  int a6 = lwpr_read_xml(&model6, model_z, e3);
+
+  ROS_INFO("%d, %d, %d, %d, %d, %d \n", e1[0], e2[0], e3[0], e4[0], e5[0], e6[0]);
+  
+  float U[T*CONTROL_DIM] = {0};
+  float u[CONTROL_DIM] = {0};
+  int kill = 0;
+  
+  //Declare a new StateUpdater object
+  float s[STATE_DIM] = {0};
+  s[2] = -.5;
+  StateUpdater ros_state(s);
+  ros_state.init_subscriber("state");
+
+  float init_goal[9] = {0};
+  init_goal[0] = 0;
+  init_goal[1] = 0;
+  init_goal[2] = -1.75;
+  StateUpdater goal(init_goal);
+  goal.init_subscriber("goal_state");
+  // exploration variance
+  float vars[] = {0.75, 0.75, 0.5, .20};
+  curandGenerator_t gen;
+  float dt = (1.0)/(1.0*HZ);
+  curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+  curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
+  
+  int i,j,count,iter;
+  count = 0;
+  while (ros::ok()) {
+    count++;
+    for (j = 0; j < STATE_DIM; j++) {
+      s[j] = ros_state.s[j];
+    }
+    for (iter = 0; iter < NUM_ITERATIONS; iter++) {
+      compute_control(s, U, goal.s, model1, model2, model3, model4, model5, model6, vars, gen);
+    }
+    //    if (DO_SMOOTHING == 1 ) {
+    if (true) {
+      u[0] = (1 - ALPHA)*U[LAG*CONTROL_DIM + 0] + (ALPHA)*u[0];
+      u[1] = (1 - ALPHA)*U[LAG*CONTROL_DIM + 1] + (ALPHA)*u[1];
+      u[2] = (1 - ALPHA)*U[LAG*CONTROL_DIM + 2] + (ALPHA)*u[2];
+      u[3] = (1 - ALPHA)*U[LAG*CONTROL_DIM + 3] + (ALPHA)*u[3];
+    } else {
+      u[0] = U[LAG*CONTROL_DIM + 0];
+      u[1] = U[LAG*CONTROL_DIM + 1];
+      u[2] = U[LAG*CONTROL_DIM + 2];
+      u[3] = U[LAG*CONTROL_DIM + 3];
+    }
+    //Publish the commands
+    control_msg.roll_rate = u[0];
+    control_msg.pitch_rate = u[1];
+    control_msg.yaw_rate = u[2];
+    control_msg.thrust = u[3];
+    if (s[2] < -4.0 || s[2] > -.07) {
+      kill = 1;
+    }
+    control_msg.kill = kill;
+    pi3_pub.publish(control_msg);
+    
+    for (i = 0; i < (T-1)*CONTROL_DIM; i++) {
+      U[i] = U[i+CONTROL_DIM];
+    }
+    for (i = T-1; i >= T - CONTROL_DIM; i--) {
+      U[i] = 0;
+    }
+    ros::spinOnce();
+    ROS_INFO("Current Location: (%f, %f, %f, %f, %f, %f, %f) \n", ros_state.s[3], ros_state.s[4], ros_state.s[5], u[0], u[1], u[2], u[3]);
+    loop_rate.sleep();
+  }
+}
+  

@@ -1,0 +1,107 @@
+#include "ros/ros.h"
+#include "pi3_crazyflie_pkg/quadrotor_state.h"
+#include "pi3_crazyflie_pkg/rpyt.h"
+#include <math.h>
+
+#define STATE_DIM 9
+#define CONTROL_DIM 4 
+#define HZ 50
+#define MASS .021
+
+//==============================
+//class definition
+class Simulator
+{
+
+private:
+  //Defines the current state of the robot
+  float dt;
+  ros::NodeHandle n;
+  ros::Subscriber sub;
+
+public:
+  Simulator(float* init_state);
+  void dynamics();
+  void controlCallback(const pi3_crazyflie_pkg::rpyt::ConstPtr& control_msg);
+  void init_subscriber();
+  float s[STATE_DIM];
+  float u[CONTROL_DIM];
+};
+
+
+Simulator::Simulator(float* init_state) {
+  int i;
+  for (i = 0; i < STATE_DIM; i++) {
+    s[i] = init_state[i];
+  }
+  for (i = 0; i < CONTROL_DIM; i++) {
+    u[i] = 0;
+  }
+  dt = 1.0/(1.0*HZ);
+}
+
+void Simulator::controlCallback(const pi3_crazyflie_pkg::rpyt::ConstPtr& control_msg) {
+  u[0] = control_msg->roll_rate;
+  u[1] = control_msg->pitch_rate;
+  u[2] = control_msg->yaw_rate;
+  u[3] = control_msg->thrust;
+  ROS_INFO("I heard: (%f, %f, %f, %f) ", control_msg->roll_rate, control_msg->pitch_rate, 
+	   control_msg->yaw_rate, control_msg->thrust);
+}
+
+void Simulator::init_subscriber() {
+  sub = n.subscribe("control", 1, &Simulator::controlCallback, this);
+}
+
+void Simulator::dynamics() {
+  //Cartesian Coordinates
+  s[0] += dt*s[6];
+  s[1] += dt*s[7];
+  s[2] += dt*s[8];
+  //1-2-3 Extrinsic Euler Angles
+  s[3] += dt*u[0];
+  s[4] += dt*u[1];
+  s[5] += dt*u[2];
+  //Cartesian Coordinate Time Derivatives
+  s[6] += dt*-(9.81*MASS + u[3])*(cos(s[3])*sin(s[4])*cos(s[5]) + sin(s[3])*sin(s[5]));
+  s[7] += dt*-(9.81*MASS + u[3])*(cos(s[3])*sin(s[4])*sin(s[5]) - sin(s[3])*cos(s[5]));
+  s[8] += dt*(-(9.81*MASS + u[3])*cos(s[4])*cos(s[3]) + 9.81*MASS);
+  //Euler Angle Time Derivatives
+}
+
+
+int main(int argc, char **argv)
+{
+  ros::init(argc, argv, "simulator");
+
+  ros::NodeHandle n1;
+  ros::Rate loop_rate(HZ);
+  ros::Publisher state_pub = n1.advertise<pi3_crazyflie_pkg::quadrotor_state>("state", 1);
+  float init_state[9] = {0};
+  Simulator simmer(init_state);
+  int count = 0;
+  simmer.init_subscriber();
+  while (ros::ok())
+  {
+    simmer.dynamics();
+    pi3_crazyflie_pkg::quadrotor_state state_msg;
+    state_msg.x = simmer.s[0];
+    state_msg.y = simmer.s[1];
+    state_msg.z = simmer.s[2];
+
+    state_msg.roll = simmer.s[3];
+    state_msg.pitch = simmer.s[4];
+    state_msg.yaw = simmer.s[5];
+
+    state_msg.x_dot = simmer.s[6];
+    state_msg.y_dot = simmer.s[7];
+    state_msg.z_dot = simmer.s[8];
+    
+    state_pub.publish(state_msg);
+    ROS_INFO("Imagined State: (%f, %f, %f, %f, %f, %f)", simmer.s[0], simmer.s[1], simmer.s[2], simmer.s[3], simmer.s[4], simmer.s[5]);
+    ros::spinOnce();
+    loop_rate.sleep();
+    ++count;
+  }
+  return 0;
+}

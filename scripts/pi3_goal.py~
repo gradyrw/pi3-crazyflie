@@ -1,0 +1,20 @@
+#!/usr/bin/env python
+
+import rospy
+import numpy as np
+from pi3_crazyflie_pkg.msg import rpyt, angles, acc, quadrotor_state, full_quadrotor_state
+import rosbag
+from std_msgs.msg import String
+from geometry_msgs.msg import TransformStamped
+
+class Sensor_Union:
+
+    def __init__(self):
+        self.goal = np.zeros(9)
+        self.full_state = np.zeros(16)
+        self.vicon_eulers = np.zeros(3)
+        rospy.init_node("transfer_node", anonymous=True)
+        rospy.Subscriber("angle_sensors", angles, self.update_angles)
+        rospy.Subscriber("control", rpyt, self.update_controls)
+        rospy.Subscriber("vicon/crazyFlieWithMast/MainBody", TransformStamped, self.update_pos_vel) 
+        self.pub = rospy.Publisher("state", quadrotor_state)
